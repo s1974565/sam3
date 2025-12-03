@@ -584,7 +584,8 @@ def process_mesh(
     loader_thread.start()
 
     with tqdm(total=len(keyframe_paths), desc=os.path.basename(mesh_directory), unit="keyframe") as pbar:
-        while True:
+        end_of_queue = False
+        while not end_of_queue:
             # Build batch from queue
             batch_info = []
             batch_images = []
@@ -592,7 +593,7 @@ def process_mesh(
             while len(batch_info) < batch_size:
                 item = image_queue.get()
                 if item is None:
-                    # End of queue
+                    end_of_queue = True
                     break
                 batch_info.append({"path": item["path"], "size": item["size"]})
                 batch_images.append(item["image"])
@@ -735,7 +736,8 @@ def process_keyframes_multi_query(
     loader_thread.start()
 
     with tqdm(total=len(keyframe_paths), desc="Processing keyframes", unit="keyframe") as pbar:
-        while True:
+        end_of_queue = False
+        while not end_of_queue:
             # Build batch from queue
             batch_info = []
             batch_images = []
@@ -743,6 +745,7 @@ def process_keyframes_multi_query(
             while len(batch_info) < batch_size:
                 item = image_queue.get()
                 if item is None:
+                    end_of_queue = True
                     break
                 batch_info.append({"path": item["path"], "size": item["size"]})
                 batch_images.append(item["image"])
