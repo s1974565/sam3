@@ -252,15 +252,15 @@ class SAM3Detector:
     def _create_datapoint(
         self,
         image: Image.Image,
-        query_text: str,
+        query_texts: List[str],
         image_index: int,
-    ) -> Tuple[Datapoint, int]:
+    ) -> Tuple[Datapoint, Dict[int, str]]:
         """
-        Create a SAM3 Datapoint for a single image with a text query.
+        Create a SAM3 Datapoint for a single image with multiple text queries.
         :param image: PIL Image to run detection on.
-        :param query_text: Text description of the object to detect.
+        :param query_texts: List of text descriptions of objects to detect.
         :param image_index: Index of this image in the batch, used for result tracking.
-        :return: A tuple containing the Datapoint and the unique query ID.
+        :return: A tuple containing the Datapoint and a dict mapping query_id to query_text.
         """
         w, h = image.size
 
@@ -270,31 +270,61 @@ class SAM3Detector:
             images=[SAMImage(data=image, objects=[], size=[h, w])],
         )
 
-        # Create the text query
-        query_id = self._query_id_counter
-        self._query_id_counter += 1
+        # Create text queries
+        query_id_to_text = {}
+        for query_text in query_texts:
+            query_id = self._query_id_counter
+            self._query_id_counter += 1
+            query_id_to_text[query_id] = query_text
 
-        find_query = FindQueryLoaded(
-            query_text=query_text,
-            image_id=0,
-            object_ids_output=[],
-            is_exhaustive=True,
-            query_processing_order=0,
-            input_bbox=None,
-            input_bbox_label=None,
-            inference_metadata=InferenceMetadata(
-                coco_image_id=query_id,
-                original_image_id=query_id,
-                original_category_id=1,
-                original_size=[w, h],
-                object_id=0,
-                frame_index=image_index,
-            ),
-        )
+            find_query = FindQueryLoaded(
+                query_text=query_text,
+                image_id=0,
+                object_ids_output=[],
+                is_exhaustive=True,
+                query_processing_order=0,
+                input_bbox=None,
+                input_bbox_label=None,
+                inference_metadata=InferenceMetadata(
+                    coco_image_id=query_id,
+                    original_image_id=query_id,
+                    original_category_id=1,
+                    original_size=[h, w],
+                    object_id=0,
+                    frame_index=image_index,
+                ),
+            )
+            datapoint.find_queries.append(find_query)
 
-        datapoint.find_queries.append(find_query)
+        return datapoint, query_id_to_text
 
-        return datapoint, query_id
+    def _extract_detection_result(self, raw_result: Optional[Dict]) -> DetectionResult:
+        """
+        Extract DetectionResult from raw postprocessor output.
+        :param raw_result: Raw result dict from postprocessor, or None.
+        :return: DetectionResult with scores and boxes tensors.
+        """
+        if raw_result is None:
+            return DetectionResult(
+                scores=torch.tensor([]),
+                boxes=torch.tensor([]).reshape(0, 4)
+            )
+
+        scores = raw_result.get("scores", torch.tensor([]))
+        boxes = raw_result.get("boxes", torch.tensor([]).reshape(0, 4))
+
+        # Ensure tensors are on CPU
+        if torch.is_tensor(scores):
+            scores = scores.cpu()
+        else:
+            scores = torch.tensor(scores)
+
+        if torch.is_tensor(boxes):
+            boxes = boxes.cpu()
+        else:
+            boxes = torch.tensor(boxes).reshape(-1, 4)
+
+        return DetectionResult(scores=scores, boxes=boxes)
 
     def detect_batch_text_guided(
         self,
@@ -303,7 +333,7 @@ class SAM3Detector:
         match_score_threshold: float,
     ) -> List[DetectionResult]:
         """
-        Detect objects in a batch of images using a text prompt.
+        Detect objects in a batch of images using a single text prompt.
         :param prompt: Text description of objects to detect (e.g., "cat", "red car").
         :param target_images: List of PIL Images to run detection on.
         :param match_score_threshold: Minimum confidence score for detections.
@@ -312,18 +342,49 @@ class SAM3Detector:
         if not target_images:
             return []
 
+        # Use multi-query method with single prompt
+        results_by_image = self.detect_batch_multi_query(
+            prompts=[prompt],
+            target_images=target_images,
+            match_score_threshold=match_score_threshold,
+        )
+
+        # Extract single prompt results
+        return [img_results.get(prompt, self._extract_detection_result(None))
+                for img_results in results_by_image]
+
+    def detect_batch_multi_query(
+        self,
+        prompts: List[str],
+        target_images: List[Image.Image],
+        match_score_threshold: float,
+    ) -> List[Dict[str, DetectionResult]]:
+        """
+        Detect objects in a batch of images using multiple text prompts.
+        Each image is encoded once, and all prompts are evaluated against it.
+        :param prompts: List of text descriptions of objects to detect.
+        :param target_images: List of PIL Images to run detection on.
+        :param match_score_threshold: Minimum confidence score for detections.
+        :return: List of dicts (one per image), each mapping prompt text to DetectionResult.
+        """
+        if not target_images or not prompts:
+            return [{} for _ in target_images] if target_images else []
+
         # Reset query ID counter for this batch
         self._query_id_counter = 0
 
-        # Create datapoints for each image
+        # Create datapoints: one per image, each with all prompts
         datapoints = []
-        query_id_to_image_idx = {}
+        # Maps query_id -> (image_index, prompt_text)
+        query_id_to_info: Dict[int, Tuple[int, str]] = {}
 
         for img_idx, image in enumerate(target_images):
-            datapoint, query_id = self._create_datapoint(image, prompt, img_idx)
+            datapoint, query_id_to_text = self._create_datapoint(image, prompts, img_idx)
             datapoint = self.transform(datapoint)
             datapoints.append(datapoint)
-            query_id_to_image_idx[query_id] = img_idx
+
+            for query_id, prompt_text in query_id_to_text.items():
+                query_id_to_info[query_id] = (img_idx, prompt_text)
 
         # Collate into batch
         batch = collate(datapoints, dict_key="dummy")["dummy"]
@@ -338,39 +399,12 @@ class SAM3Detector:
         postprocessor = self._get_postprocessor(match_score_threshold)
         raw_results = postprocessor.process_results(output, batch.find_metadatas)
 
-        # Convert to list of DetectionResult, ordered by image index
-        results = []
-        for img_idx in range(len(target_images)):
-            # Find the query_id for this image
-            query_id = None
-            for qid, idx in query_id_to_image_idx.items():
-                if idx == img_idx:
-                    query_id = qid
-                    break
+        # Organize results: List[Dict[prompt_text, DetectionResult]]
+        results: List[Dict[str, DetectionResult]] = [{} for _ in target_images]
 
-            if query_id is not None and query_id in raw_results:
-                result = raw_results[query_id]
-                scores = result.get("scores", torch.tensor([]))
-                boxes = result.get("boxes", torch.tensor([]).reshape(0, 4))
-
-                # Ensure tensors are on CPU
-                if torch.is_tensor(scores):
-                    scores = scores.cpu()
-                else:
-                    scores = torch.tensor(scores)
-
-                if torch.is_tensor(boxes):
-                    boxes = boxes.cpu()
-                else:
-                    boxes = torch.tensor(boxes).reshape(-1, 4)
-
-                results.append(DetectionResult(scores=scores, boxes=boxes))
-            else:
-                # No detections for this image
-                results.append(DetectionResult(
-                    scores=torch.tensor([]),
-                    boxes=torch.tensor([]).reshape(0, 4)
-                ))
+        for query_id, (img_idx, prompt_text) in query_id_to_info.items():
+            raw_result = raw_results.get(query_id)
+            results[img_idx][prompt_text] = self._extract_detection_result(raw_result)
 
         return results
 
@@ -625,6 +659,202 @@ def process_mesh(
     return detection_results
 
 
+def _filter_detections(
+    result: DetectionResult,
+    keyframe_height: int,
+    keyframe_width: int,
+    minimum_box_area: int,
+) -> Dict[str, Any]:
+    """
+    Filter detections by clamping to image bounds and minimum area.
+    :param result: DetectionResult with scores and boxes.
+    :param keyframe_height: Height of the keyframe image.
+    :param keyframe_width: Width of the keyframe image.
+    :param minimum_box_area: Minimum bounding box area in pixels.
+    :return: Dict with 'bboxes' and 'scores' lists, or empty dict if no valid detections.
+    """
+    filtered_bboxes = []
+    filtered_scores = []
+
+    scores = result.scores.tolist() if torch.is_tensor(result.scores) else result.scores
+    boxes = result.boxes.tolist() if torch.is_tensor(result.boxes) else result.boxes
+
+    for score, box in zip(scores, boxes):
+        x1, y1, x2, y2 = box
+
+        # Clamp to image bounds
+        x1c = round(max(0, min(x1, keyframe_width - 1)))
+        y1c = round(max(0, min(y1, keyframe_height - 1)))
+        x2c = round(max(0, min(x2, keyframe_width - 1)))
+        y2c = round(max(0, min(y2, keyframe_height - 1)))
+
+        # Filter by minimum area
+        area = max(0, x2c - x1c) * max(0, y2c - y1c)
+        if area >= minimum_box_area:
+            filtered_bboxes.append([x1c, y1c, x2c, y2c])
+            filtered_scores.append(float(score))
+
+    if filtered_bboxes:
+        return {"bboxes": filtered_bboxes, "scores": filtered_scores}
+    return {}
+
+
+def process_keyframes_multi_query(
+    detector: SAM3Detector,
+    mesh_queries: Dict[str, str],
+    keyframe_paths: List[str],
+    batch_size: int,
+    match_score_threshold: float,
+    minimum_box_area: int,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Process all keyframes with multiple mesh queries efficiently.
+    Each keyframe is encoded once, and all queries are evaluated against it.
+    :param detector: SAM3Detector instance to use for detection.
+    :param mesh_queries: Dict mapping mesh_name to query_text.
+    :param keyframe_paths: List of keyframe image paths to process.
+    :param batch_size: Number of images to process per batch.
+    :param match_score_threshold: Minimum confidence score for detections.
+    :param minimum_box_area: Minimum bounding box area in pixels.
+    :return: Dict mapping mesh_name to dict of keyframe_filename to detection results.
+    """
+    if not mesh_queries or not keyframe_paths:
+        return {}
+
+    mesh_names = list(mesh_queries.keys())
+    prompts = list(mesh_queries.values())
+
+    # Initialize results structure: {mesh_name: {keyframe_filename: {bboxes, scores}}}
+    final_results: Dict[str, Dict[str, Dict[str, Any]]] = {name: {} for name in mesh_names}
+
+    keyframe_paths = copy.deepcopy(keyframe_paths)
+
+    # Start async image loader
+    image_queue = queue.Queue(maxsize=batch_size * 2)
+    loader_thread = threading.Thread(target=keyframe_loader, args=(keyframe_paths, image_queue))
+    loader_thread.start()
+
+    with tqdm(total=len(keyframe_paths), desc="Processing keyframes", unit="keyframe") as pbar:
+        while True:
+            # Build batch from queue
+            batch_info = []
+            batch_images = []
+
+            while len(batch_info) < batch_size:
+                item = image_queue.get()
+                if item is None:
+                    break
+                batch_info.append({"path": item["path"], "size": item["size"]})
+                batch_images.append(item["image"])
+
+            if not batch_images:
+                break
+
+            # Run detection with all queries at once
+            try:
+                results = detector.detect_batch_multi_query(
+                    prompts=prompts,
+                    target_images=batch_images,
+                    match_score_threshold=match_score_threshold,
+                )
+            except Exception as e:
+                print(f"Detection failed for batch: {e}", file=sys.stderr)
+                results = [{} for _ in batch_images]
+
+            # Process results for each image
+            for idx, img_results in enumerate(results):
+                keyframe_path = batch_info[idx]["path"]
+                keyframe_filename = os.path.basename(keyframe_path)
+                keyframe_height, keyframe_width = batch_info[idx]["size"]
+
+                # Extract results for each mesh
+                for mesh_name, query_text in mesh_queries.items():
+                    if query_text in img_results:
+                        filtered = _filter_detections(
+                            img_results[query_text],
+                            keyframe_height,
+                            keyframe_width,
+                            minimum_box_area,
+                        )
+                        if filtered:
+                            final_results[mesh_name][keyframe_filename] = filtered
+
+            pbar.update(len(batch_info))
+
+            # Cleanup
+            for img in batch_images:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+
+            torch.cuda.empty_cache()
+
+    loader_thread.join()
+    return final_results
+
+
+def detect_meshes_efficient(
+    keyframe_directory: str = cfg.OD_KEYFRAME_DIRECTORY,
+    mesh_root_directory: str = cfg.OD_MESH_ROOT_DIRECTORY,
+    output_path: str = cfg.OD_OUTPUT_PATH,
+    query_text_filename: str = cfg.OD_QUERY_TEXT_FILENAME,
+    batch_size: int = cfg.OD_BATCH_SIZE,
+    match_score_threshold: float = cfg.OD_MATCH_SCORE_THRESHOLD,
+    minimum_box_area: int = cfg.OD_MINIMUM_BOX_AREA,
+) -> None:
+    """
+    Run object detection on all meshes across all keyframes efficiently.
+    Uses multi-query detection: each keyframe is encoded once with all mesh queries.
+    :param keyframe_directory: Directory containing keyframe images.
+    :param mesh_root_directory: Root directory containing mesh subdirectories.
+    :param output_path: Path to save detection results JSON file.
+    :param query_text_filename: Name of text query file in each mesh directory.
+    :param batch_size: Number of images to process per batch.
+    :param match_score_threshold: Minimum confidence score for detections.
+    :param minimum_box_area: Minimum bounding box area in pixels.
+    :return:
+    """
+    keyframe_paths = list_images(keyframe_directory)
+    mesh_directories = list_mesh_directories(mesh_root_directory)
+
+    print(f"Found {len(keyframe_paths)} keyframes and {len(mesh_directories)} meshes.")
+
+    # Load all mesh queries upfront
+    mesh_queries: Dict[str, str] = {}
+    for mesh_directory in mesh_directories:
+        mesh_name = os.path.basename(mesh_directory)
+        query_text_path = os.path.join(mesh_directory, query_text_filename)
+
+        if os.path.exists(query_text_path):
+            with open(query_text_path, "r", encoding="utf-8") as f:
+                mesh_queries[mesh_name] = f.read().strip()
+        else:
+            mesh_queries[mesh_name] = mesh_name
+            print(f"[SAM3] No text file for '{mesh_name}', using directory name as query.")
+
+    print(f"Loaded {len(mesh_queries)} mesh queries: {list(mesh_queries.keys())}")
+
+    # Initialize SAM3 detector
+    detector = SAM3Detector()
+
+    # Process all keyframes with all queries
+    final_results = process_keyframes_multi_query(
+        detector=detector,
+        mesh_queries=mesh_queries,
+        keyframe_paths=keyframe_paths,
+        batch_size=batch_size,
+        match_score_threshold=match_score_threshold,
+        minimum_box_area=minimum_box_area,
+    )
+
+    # Save results
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(final_results, f, indent=4)
+
+    print(f"Saved detection results to {output_path}.")
+
+
 def detect_meshes(
     keyframe_directory: str = cfg.OD_KEYFRAME_DIRECTORY,
     mesh_root_directory: str = cfg.OD_MESH_ROOT_DIRECTORY,
@@ -680,4 +910,5 @@ def detect_meshes(
 
 
 if __name__ == "__main__":
-    detect_meshes(query_mode="text")
+    # Use the efficient multi-query pipeline
+    detect_meshes_efficient()
