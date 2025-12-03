@@ -3,14 +3,14 @@
 Object detection module using SAM3 (Segment Anything Model 3).
 
 This module provides detection capabilities using SAM3's text-guided detection.
-It replaces the previous OWLv2-based detection with SAM3's more powerful
-vision-language understanding.
 """
 
 import json
 import os
+import queue
 import sys
 import copy
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -73,6 +73,22 @@ def list_mesh_directories(mesh_root_directory: str) -> List[str]:
     ])
 
 
+def keyframe_loader(keyframe_paths: List[str], out_queue: queue.Queue):
+    """
+    Load keyframe images asynchronously and put them into a queue.
+    :param keyframe_paths: List of paths to keyframe images.
+    :param out_queue: Queue to put loaded images into.
+    :return:
+    """
+    for keyframe_path in keyframe_paths:
+        try:
+            image = Image.open(keyframe_path).convert("RGB")
+            out_queue.put({"path": keyframe_path, "image": image, "size": (image.height, image.width)})
+        except Exception as e:
+            print(f"Failed to load {keyframe_path}: {e}", file=sys.stderr)
+    out_queue.put(None)
+
+
 def visualize_bboxes_for_keyframe(
     image_path: str,
     mesh_name: str,
@@ -80,8 +96,6 @@ def visualize_bboxes_for_keyframe(
 ) -> None:
     """
     Visualize detection bounding boxes for a specific keyframe and mesh.
-    Displays a matplotlib figure showing the keyframe image with overlaid
-    bounding boxes and confidence scores for the specified mesh object.
     :param image_path: Path to the keyframe image file.
     :param mesh_name: Name of the mesh/object to visualize detections for.
     :param detection_output_path: Path to the JSON file containing detection results.
@@ -290,12 +304,10 @@ class SAM3Detector:
     ) -> List[DetectionResult]:
         """
         Detect objects in a batch of images using a text prompt.
-        This method processes multiple images in a single batched forward pass for efficiency.
-        Each image is queried with the same text prompt.
         :param prompt: Text description of objects to detect (e.g., "cat", "red car").
         :param target_images: List of PIL Images to run detection on.
-        :param match_score_threshold: Minimum confidence score for detections. Detections below this threshold are filtered out.
-        :return: List of DetectionResult, one per input image. Each result contains scores (shape [N]) and boxes (shape [N, 4] in XYXY format).
+        :param match_score_threshold: Minimum confidence score for detections.
+        :return: List of DetectionResult, one per input image.
         """
         if not target_images:
             return []
@@ -387,13 +399,11 @@ class SAM3Detector:
         )
 
 
-########## Legacy OWLv2 Detector (kept for reference) ##########
+########## OWLv2 Detector ##########
 
 class OwlV2Detector:
     """
-    OWLv2-based object detector (legacy).
-    This class is kept for reference and fallback purposes.
-    Consider using SAM3Detector for better performance.
+    OWLv2-based object detector.
     """
 
     def __init__(self, model_id: str = "google/owlv2-base-patch16-ensemble"):
@@ -426,7 +436,7 @@ class OwlV2Detector:
         :param target_images: List of PIL Images to run detection on.
         :param match_score_threshold: Minimum confidence score for detections.
         :param image_nms_threshold: NMS threshold for overlapping detections.
-        :return: List of detection dictionaries, one per input image. Each dictionary contains 'scores' and 'boxes' keys.
+        :return: List of detection dictionaries, one per input image.
         """
         inputs = self.processor(
             images=target_images,
@@ -463,7 +473,7 @@ class OwlV2Detector:
         :param prompt: Text description of objects to detect.
         :param target_images: List of PIL Images to run detection on.
         :param match_score_threshold: Minimum confidence score for detections.
-        :return: List of detection dictionaries, one per input image. Each dictionary contains 'scores' and 'boxes' keys.
+        :return: List of detection dictionaries, one per input image.
         """
         inputs = self.processor(
             text=[prompt for _ in range(len(target_images))],
@@ -504,36 +514,29 @@ def process_mesh(
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process a single mesh directory and detect objects in all keyframes.
-    Loads the query (text or image-based), processes keyframes in batches, and returns filtered detection results.
-    :param query_mode: Detection mode. Use "text" for text-guided detection or "image" for image-guided (falls back to text for SAM3).
+    :param query_mode: Detection mode ("text" or "image", falls back to text for SAM3).
     :param detector: SAM3Detector instance to use for detection.
     :param mesh_directory: Path to mesh directory containing query text/image files.
     :param keyframe_paths: List of keyframe image paths to process.
     :param query_text_filename: Filename of the text query file in mesh directory.
     :param batch_size: Number of images to process per batch.
     :param match_score_threshold: Minimum confidence score for detections.
-    :param minimum_box_area: Minimum bounding box area in pixels. Detections with smaller area are filtered out.
-    :param image_nms_threshold: NMS threshold. Not used for SAM3 text-guided detection, kept for API compatibility.
-    :return: Dictionary mapping keyframe filenames to detection results. Each result contains 'bboxes' (list of [x1, y1, x2, y2]) and 'scores' (list of confidence scores).
+    :param minimum_box_area: Minimum bounding box area in pixels.
+    :param image_nms_threshold: NMS threshold (not used for SAM3 text-guided).
+    :return: Dictionary mapping keyframe filenames to detection results.
     """
     # Load query
-    query_image = None
-    query_text = None
-
     if query_mode == "image":
-        # For image-guided mode, we need to fall back to text if available
-        # since SAM3 doesn't support image-guided detection yet
+        # For image-guided mode, fall back to text if available
         query_text_path = os.path.join(mesh_directory, query_text_filename)
         if os.path.exists(query_text_path):
             with open(query_text_path, "r", encoding="utf-8") as f:
                 query_text = f.read().strip()
             print(f"[SAM3] Image-guided mode requested but using text fallback: '{query_text}'")
         else:
-            # Try to use mesh directory name as query text
             query_text = os.path.basename(mesh_directory)
             print(f"[SAM3] No text file found, using directory name as query: '{query_text}'")
     else:
-        # Text-guided mode
         query_text_path = os.path.join(mesh_directory, query_text_filename)
         with open(query_text_path, "r", encoding="utf-8") as f:
             query_text = f.read().strip()
@@ -541,23 +544,24 @@ def process_mesh(
     detection_results = {}
     keyframe_paths = copy.deepcopy(keyframe_paths)
 
+    # Start async image loader
+    image_queue = queue.Queue(maxsize=batch_size * 2)
+    loader_thread = threading.Thread(target=keyframe_loader, args=(keyframe_paths, image_queue))
+    loader_thread.start()
+
     with tqdm(total=len(keyframe_paths), desc=os.path.basename(mesh_directory), unit="keyframe") as pbar:
-        while keyframe_paths:
-            # Build batch
+        while True:
+            # Build batch from queue
             batch_info = []
             batch_images = []
 
-            while len(batch_info) < batch_size and keyframe_paths:
-                keyframe_path = keyframe_paths.pop(0)
-                try:
-                    keyframe_image = Image.open(keyframe_path).convert("RGB")
-                    batch_info.append({
-                        "path": keyframe_path,
-                        "size": (keyframe_image.height, keyframe_image.width),
-                    })
-                    batch_images.append(keyframe_image)
-                except Exception as e:
-                    print(f"Failed to load {keyframe_path}: {e}", file=sys.stderr)
+            while len(batch_info) < batch_size:
+                item = image_queue.get()
+                if item is None:
+                    # End of queue
+                    break
+                batch_info.append({"path": item["path"], "size": item["size"]})
+                batch_images.append(item["image"])
 
             if not batch_images:
                 break
@@ -617,6 +621,7 @@ def process_mesh(
 
             torch.cuda.empty_cache()
 
+    loader_thread.join()
     return detection_results
 
 
@@ -633,12 +638,10 @@ def detect_meshes(
 ) -> None:
     """
     Run object detection on all meshes across all keyframes.
-    This is the main entry point for the detection pipeline. It iterates over all mesh directories,
-    detects objects in all keyframes using the specified query mode, and saves results to a JSON file.
     :param keyframe_directory: Directory containing keyframe images.
-    :param mesh_root_directory: Root directory containing mesh subdirectories. Each subdirectory should contain query files.
+    :param mesh_root_directory: Root directory containing mesh subdirectories.
     :param output_path: Path to save detection results JSON file.
-    :param query_mode: Detection mode. Use "text" for text-guided detection or "image" for image-guided (falls back to text for SAM3).
+    :param query_mode: Detection mode ("text" or "image").
     :param query_text_filename: Name of text query file in each mesh directory.
     :param batch_size: Number of images to process per batch.
     :param match_score_threshold: Minimum confidence score for detections.
@@ -677,11 +680,4 @@ def detect_meshes(
 
 
 if __name__ == "__main__":
-    # Run detection with text queries
     detect_meshes(query_mode="text")
-
-    # Example visualization (uncomment to use):
-    # visualize_bboxes_for_keyframe(
-    #     os.path.join(cfg.OD_KEYFRAME_DIRECTORY, "keyframe_435.jpg"),
-    #     "bear"
-    # )
