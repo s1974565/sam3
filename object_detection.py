@@ -12,7 +12,7 @@ import os
 import sys
 import copy
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import torch
 from PIL import Image
@@ -47,7 +47,14 @@ torch.backends.cudnn.allow_tf32 = True
 ########## Utilities ##########
 
 def list_images(image_directory: str) -> List[str]:
-    """List all image files in a directory, sorted alphabetically."""
+    """
+    List all image files in a directory, sorted alphabetically.
+
+    :param image_directory: Path to the directory containing images.
+    :type image_directory: str
+    :returns: Sorted list of absolute paths to image files.
+    :rtype: List[str]
+    """
     return_list = []
     for filename in os.listdir(image_directory):
         filepath = os.path.join(image_directory, filename)
@@ -57,7 +64,14 @@ def list_images(image_directory: str) -> List[str]:
 
 
 def list_mesh_directories(mesh_root_directory: str) -> List[str]:
-    """List all mesh subdirectories in the root directory."""
+    """
+    List all mesh subdirectories in the root directory.
+
+    :param mesh_root_directory: Path to the root directory containing mesh subdirectories.
+    :type mesh_root_directory: str
+    :returns: Sorted list of absolute paths to mesh directories.
+    :rtype: List[str]
+    """
     return sorted([
         os.path.join(mesh_root_directory, mesh_directory)
         for mesh_directory in os.listdir(mesh_root_directory)
@@ -70,7 +84,22 @@ def visualize_bboxes_for_keyframe(
     mesh_name: str,
     detection_output_path: str = cfg.OD_OUTPUT_PATH
 ) -> None:
-    """Visualize detection bounding boxes for a specific keyframe and mesh."""
+    """
+    Visualize detection bounding boxes for a specific keyframe and mesh.
+
+    Displays a matplotlib figure showing the keyframe image with overlaid
+    bounding boxes and confidence scores for the specified mesh object.
+
+    :param image_path: Path to the keyframe image file.
+    :type image_path: str
+    :param mesh_name: Name of the mesh/object to visualize detections for.
+    :type mesh_name: str
+    :param detection_output_path: Path to the JSON file containing detection results.
+        Defaults to ``cfg.OD_OUTPUT_PATH``.
+    :type detection_output_path: str
+    :returns: None
+    :rtype: None
+    """
     import matplotlib.pyplot as plt
     from matplotlib import patches
 
@@ -142,17 +171,33 @@ def visualize_bboxes_for_keyframe(
 
 @dataclass
 class DetectionResult:
-    """Detection result for a single image, matching OWLv2 output format."""
-    scores: torch.Tensor  # Shape: [N]
-    boxes: torch.Tensor   # Shape: [N, 4] in XYXY format
+    """
+    Detection result for a single image, matching OWLv2 output format.
+
+    :ivar scores: Confidence scores for each detection. Shape: ``[N]``.
+    :vartype scores: torch.Tensor
+    :ivar boxes: Bounding boxes in XYXY format (pixel coordinates). Shape: ``[N, 4]``.
+    :vartype boxes: torch.Tensor
+    """
+    scores: torch.Tensor
+    boxes: torch.Tensor
 
 
 class SAM3Detector:
     """
     SAM3-based object detector.
 
-    This class provides an interface similar to OwlV2Detector for easy replacement.
+    This class provides an interface similar to ``OwlV2Detector`` for easy replacement.
     It uses SAM3's text-guided detection capabilities.
+
+    :ivar device_name: Name of the compute device ('cuda' or 'cpu').
+    :vartype device_name: str
+    :ivar device: PyTorch device object.
+    :vartype device: torch.device
+    :ivar model: The SAM3 image model.
+    :vartype model: torch.nn.Module
+    :ivar transform: Image transformation pipeline.
+    :vartype transform: ComposeAPI
     """
 
     def __init__(
@@ -163,9 +208,12 @@ class SAM3Detector:
         """
         Initialize the SAM3 detector.
 
-        Args:
-            bpe_path: Path to BPE vocabulary file. If None, uses default.
-            compile_model: Whether to compile the model for faster inference.
+        :param bpe_path: Path to BPE vocabulary file. If ``None``, uses the default
+            path from the SAM3 assets directory.
+        :type bpe_path: Optional[str]
+        :param compile_model: Whether to compile the model for faster inference
+            using ``torch.compile``.
+        :type compile_model: bool
         """
         self.device_name = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(self.device_name)
@@ -201,7 +249,14 @@ class SAM3Detector:
         print("[SAM3] Model loaded successfully.")
 
     def _get_postprocessor(self, detection_threshold: float) -> PostProcessImage:
-        """Get or create a postprocessor with the given threshold."""
+        """
+        Get or create a postprocessor with the given threshold.
+
+        :param detection_threshold: Minimum confidence score for detections.
+        :type detection_threshold: float
+        :returns: Postprocessor configured with the specified threshold.
+        :rtype: PostProcessImage
+        """
         if detection_threshold not in self._postprocessor_cache:
             self._postprocessor_cache[detection_threshold] = PostProcessImage(
                 max_dets_per_img=-1,
@@ -219,17 +274,18 @@ class SAM3Detector:
         image: Image.Image,
         query_text: str,
         image_index: int,
-    ) -> tuple[Datapoint, int]:
+    ) -> Tuple[Datapoint, int]:
         """
         Create a SAM3 Datapoint for a single image with a text query.
 
-        Args:
-            image: PIL Image to run detection on
-            query_text: Text description of object to detect
-            image_index: Index of this image in the batch (for result tracking)
-
-        Returns:
-            Tuple of (Datapoint, query_id)
+        :param image: PIL Image to run detection on.
+        :type image: PIL.Image.Image
+        :param query_text: Text description of the object to detect.
+        :type query_text: str
+        :param image_index: Index of this image in the batch, used for result tracking.
+        :type image_index: int
+        :returns: A tuple containing the Datapoint and the unique query ID.
+        :rtype: Tuple[Datapoint, int]
         """
         w, h = image.size
 
@@ -274,16 +330,22 @@ class SAM3Detector:
         """
         Detect objects in a batch of images using a text prompt.
 
-        Args:
-            prompt: Text description of objects to detect (e.g., "cat", "red car")
-            target_images: List of PIL Images to run detection on
-            match_score_threshold: Minimum confidence score for detections
+        This method processes multiple images in a single batched forward pass
+        for efficiency. Each image is queried with the same text prompt.
 
-        Returns:
-            List of DetectionResult, one per input image.
-            Each result contains:
-                - scores: Tensor of confidence scores [N]
-                - boxes: Tensor of bounding boxes [N, 4] in XYXY format (pixel coords)
+        :param prompt: Text description of objects to detect (e.g., "cat", "red car").
+        :type prompt: str
+        :param target_images: List of PIL Images to run detection on.
+        :type target_images: List[PIL.Image.Image]
+        :param match_score_threshold: Minimum confidence score for detections.
+            Detections below this threshold are filtered out.
+        :type match_score_threshold: float
+        :returns: List of ``DetectionResult``, one per input image. Each result contains:
+
+            - ``scores``: Tensor of confidence scores with shape ``[N]``
+            - ``boxes``: Tensor of bounding boxes with shape ``[N, 4]`` in XYXY format
+
+        :rtype: List[DetectionResult]
         """
         if not target_images:
             return []
@@ -360,17 +422,21 @@ class SAM3Detector:
         """
         Detect objects in a batch of images using a reference image query.
 
-        NOTE: This is a placeholder. SAM3's visual exemplar feature is not fully
-        exposed in the public API. For now, this raises NotImplementedError.
+        .. note::
+            This is a placeholder. SAM3's visual exemplar feature is not fully
+            exposed in the public API. For now, this raises ``NotImplementedError``.
 
-        Args:
-            query_image: Reference image showing the object to detect
-            target_images: List of PIL Images to run detection on
-            match_score_threshold: Minimum confidence score for detections
-            image_nms_threshold: NMS threshold for overlapping detections
-
-        Returns:
-            List of DetectionResult, one per input image.
+        :param query_image: Reference image showing the object to detect.
+        :type query_image: PIL.Image.Image
+        :param target_images: List of PIL Images to run detection on.
+        :type target_images: List[PIL.Image.Image]
+        :param match_score_threshold: Minimum confidence score for detections.
+        :type match_score_threshold: float
+        :param image_nms_threshold: NMS threshold for overlapping detections.
+        :type image_nms_threshold: float
+        :returns: List of ``DetectionResult``, one per input image.
+        :rtype: List[DetectionResult]
+        :raises NotImplementedError: Always raised as this feature is not yet supported.
         """
         raise NotImplementedError(
             "Image-guided detection is not yet supported in SAM3Detector. "
@@ -387,10 +453,26 @@ class OwlV2Detector:
     OWLv2-based object detector (legacy).
 
     This class is kept for reference and fallback purposes.
-    Consider using SAM3Detector for better performance.
+    Consider using ``SAM3Detector`` for better performance.
+
+    :ivar device_name: Name of the compute device ('cuda' or 'cpu').
+    :vartype device_name: str
+    :ivar device: PyTorch device object.
+    :vartype device: torch.device
+    :ivar processor: OWLv2 processor for input preprocessing.
+    :vartype processor: Owlv2Processor
+    :ivar model: The OWLv2 model.
+    :vartype model: Owlv2ForObjectDetection
     """
 
     def __init__(self, model_id: str = "google/owlv2-base-patch16-ensemble"):
+        """
+        Initialize the OWLv2 detector.
+
+        :param model_id: HuggingFace model ID for OWLv2.
+            Defaults to ``"google/owlv2-base-patch16-ensemble"``.
+        :type model_id: str
+        """
         from transformers import Owlv2Processor, Owlv2ForObjectDetection
 
         self.device_name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -410,6 +492,21 @@ class OwlV2Detector:
         match_score_threshold: float,
         image_nms_threshold: float,
     ) -> List[Dict[str, Any]]:
+        """
+        Detect objects in a batch of images using a reference image query.
+
+        :param query_image: Reference image showing the object to detect.
+        :type query_image: PIL.Image.Image
+        :param target_images: List of PIL Images to run detection on.
+        :type target_images: List[PIL.Image.Image]
+        :param match_score_threshold: Minimum confidence score for detections.
+        :type match_score_threshold: float
+        :param image_nms_threshold: NMS threshold for overlapping detections.
+        :type image_nms_threshold: float
+        :returns: List of detection dictionaries, one per input image.
+            Each dictionary contains ``'scores'`` and ``'boxes'`` keys.
+        :rtype: List[Dict[str, Any]]
+        """
         inputs = self.processor(
             images=target_images,
             query_images=query_image,
@@ -440,6 +537,19 @@ class OwlV2Detector:
         target_images: List[Image.Image],
         match_score_threshold: float,
     ) -> List[Dict[str, Any]]:
+        """
+        Detect objects in a batch of images using a text prompt.
+
+        :param prompt: Text description of objects to detect.
+        :type prompt: str
+        :param target_images: List of PIL Images to run detection on.
+        :type target_images: List[PIL.Image.Image]
+        :param match_score_threshold: Minimum confidence score for detections.
+        :type match_score_threshold: float
+        :returns: List of detection dictionaries, one per input image.
+            Each dictionary contains ``'scores'`` and ``'boxes'`` keys.
+        :rtype: List[Dict[str, Any]]
+        """
         inputs = self.processor(
             text=[prompt for _ in range(len(target_images))],
             images=target_images,
@@ -475,24 +585,39 @@ def process_mesh(
     batch_size: int,
     match_score_threshold: float,
     minimum_box_area: int,
-    image_nms_threshold: float,  # Not used for SAM3 text-guided, kept for API compatibility
+    image_nms_threshold: float,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process a single mesh directory and detect objects in all keyframes.
 
-    Args:
-        query_mode: "text" for text-guided detection, "image" for image-guided
-        detector: SAM3Detector instance
-        mesh_directory: Path to mesh directory containing query text/image
-        keyframe_paths: List of keyframe image paths to process
-        query_text_filename: Filename of text query file in mesh directory
-        batch_size: Number of images to process per batch
-        match_score_threshold: Minimum confidence score for detections
-        minimum_box_area: Minimum bounding box area in pixels
-        image_nms_threshold: NMS threshold (not used for SAM3 text-guided)
+    This function loads the query (text or image-based), processes keyframes
+    in batches, and returns filtered detection results.
 
-    Returns:
-        Dictionary mapping keyframe filenames to detection results
+    :param query_mode: Detection mode. Use ``"text"`` for text-guided detection
+        or ``"image"`` for image-guided (falls back to text for SAM3).
+    :type query_mode: str
+    :param detector: SAM3Detector instance to use for detection.
+    :type detector: SAM3Detector
+    :param mesh_directory: Path to mesh directory containing query text/image files.
+    :type mesh_directory: str
+    :param keyframe_paths: List of keyframe image paths to process.
+    :type keyframe_paths: List[str]
+    :param query_text_filename: Filename of the text query file in mesh directory.
+    :type query_text_filename: str
+    :param batch_size: Number of images to process per batch.
+    :type batch_size: int
+    :param match_score_threshold: Minimum confidence score for detections.
+    :type match_score_threshold: float
+    :param minimum_box_area: Minimum bounding box area in pixels.
+        Detections with smaller area are filtered out.
+    :type minimum_box_area: int
+    :param image_nms_threshold: NMS threshold. Not used for SAM3 text-guided
+        detection, kept for API compatibility.
+    :type image_nms_threshold: float
+    :returns: Dictionary mapping keyframe filenames to detection results.
+        Each result contains ``'bboxes'`` (list of [x1, y1, x2, y2]) and
+        ``'scores'`` (list of confidence scores).
+    :rtype: Dict[str, Dict[str, Any]]
     """
     # Load query
     query_image = None
@@ -612,16 +737,41 @@ def detect_meshes(
     """
     Run object detection on all meshes across all keyframes.
 
-    Args:
-        keyframe_directory: Directory containing keyframe images
-        mesh_root_directory: Root directory containing mesh subdirectories
-        output_path: Path to save detection results JSON
-        query_mode: "text" or "image" (image falls back to text for SAM3)
-        query_text_filename: Name of text query file in each mesh directory
-        batch_size: Number of images to process per batch
-        match_score_threshold: Minimum confidence score for detections
-        minimum_box_area: Minimum bounding box area in pixels
-        image_nms_threshold: NMS threshold (not used for SAM3 text-guided)
+    This is the main entry point for the detection pipeline. It iterates
+    over all mesh directories, detects objects in all keyframes using the
+    specified query mode, and saves results to a JSON file.
+
+    :param keyframe_directory: Directory containing keyframe images.
+        Defaults to ``cfg.OD_KEYFRAME_DIRECTORY``.
+    :type keyframe_directory: str
+    :param mesh_root_directory: Root directory containing mesh subdirectories.
+        Each subdirectory should contain query files. Defaults to
+        ``cfg.OD_MESH_ROOT_DIRECTORY``.
+    :type mesh_root_directory: str
+    :param output_path: Path to save detection results JSON file.
+        Defaults to ``cfg.OD_OUTPUT_PATH``.
+    :type output_path: str
+    :param query_mode: Detection mode. Use ``"text"`` for text-guided detection
+        or ``"image"`` for image-guided (falls back to text for SAM3).
+        Defaults to ``cfg.OD_QUERY_MODE``.
+    :type query_mode: str
+    :param query_text_filename: Name of text query file in each mesh directory.
+        Defaults to ``cfg.OD_QUERY_TEXT_FILENAME``.
+    :type query_text_filename: str
+    :param batch_size: Number of images to process per batch.
+        Defaults to ``cfg.OD_BATCH_SIZE``.
+    :type batch_size: int
+    :param match_score_threshold: Minimum confidence score for detections.
+        Defaults to ``cfg.OD_MATCH_SCORE_THRESHOLD``.
+    :type match_score_threshold: float
+    :param minimum_box_area: Minimum bounding box area in pixels.
+        Defaults to ``cfg.OD_MINIMUM_BOX_AREA``.
+    :type minimum_box_area: int
+    :param image_nms_threshold: NMS threshold (not used for SAM3 text-guided).
+        Defaults to ``cfg.OD_IMAGE_NMS_THRESHOLD``.
+    :type image_nms_threshold: float
+    :returns: None. Results are saved to the specified output path.
+    :rtype: None
     """
     keyframe_paths = list_images(keyframe_directory)
     mesh_directories = list_mesh_directories(mesh_root_directory)
